@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Hide Processed Reports
 // @namespace    http://tampermonkey.net/
-// @version      1.0
-// @description  Locally hides messages in #overwatch-reports that have a string or reactions
+// @version      1.01
+// @description  Efficiently hides messages in #overwatch-reports with reactions/strings
 // @author       Snipebusher
 // @match        https://discord.com/channels/549281623154229250/1097451336183857173
 // @grant        none
@@ -10,38 +10,39 @@
 
 (function() {
     'use strict';
-
-    const MAX_MESSAGE_AGE_MS = 30 * 24 * 60 * 60 * 1000;
-    const HIDE_DELAY_MS = 100;
-    const MAX_HIDDEN_MESSAGES = 0;
+    // =========================
+    // TWEAKABLE SETTINGS
+    // =========================
+    const MAX_MESSAGE_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+    const HIDE_DELAY_MS = 70;
+    const LOOP_DELAY_MS = 2000;
+    const HIDE_SCROLL_LOOP_COUNT = 3;
+    const UI_POLL_INITIAL_DELAY_MS = 200;
+    const UI_POLL_MAX_DELAY_MS = 1000;
     const SCROLL_STOP_DELAY_MS = 1000;
-    const LOOP_DELAY_MS = 1000;
-    const HIDE_SCROLL_LOOP_COUNT = 2;
 
     let hideSystemMessages = false;
-    let hiddenCount = 0;
-    let scrollTimeout = null;
-    let processingBatch = false;
-    let anchorDateString = null;
 
     const SCROLLER_SELECTOR = '[class*="scrollerInner"]';
     const MESSAGE_ITEM_SEL = 'li[id^="chat-messages-"]';
     const DIVIDER_SEL = 'div[class*="divider__"][role="separator"]';
 
-    const MONTH_NAMES = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+    const MONTH_NAMES = [
+        "January","February","March","April","May","June",
+        "July","August","September","October","November","December"
+    ];
 
     function parseUserDate(input) {
         const parts = input.trim().split('/');
         if (parts.length !== 3) return null;
         let [d, m, y] = parts.map(p => p.trim());
-        if (!/^[0-9]{1,2}$/.test(d) || !/^[0-9]{1,2}$/.test(m) || !/^[0-9]{1,4}$/.test(y)) return null;
-        let day = parseInt(d, 10);
-        let month = parseInt(m, 10);
-        let year = parseInt(y, 10);
+        if (!/^\d{1,2}$/.test(d) || !/^\d{1,2}$/.test(m) || !/^\d{1,4}$/.test(y)) return null;
+        let day = parseInt(d, 10),
+            month = parseInt(m, 10),
+            year = parseInt(y, 10);
         if (day < 1 || day > 31 || month < 1 || month > 12) return null;
         if (y.length <= 2) year += 2000;
-        const monthName = MONTH_NAMES[month - 1];
-        return `${monthName} ${day}, ${year}`;
+        return `${MONTH_NAMES[month - 1]} ${day}, ${year}`;
     }
 
     function isSystemMessage(msgDiv) {
@@ -57,8 +58,7 @@
 
     function isRecent(msgDiv) {
         const msgTime = getMessageTime(msgDiv);
-        if (!msgTime) return false;
-        return (Date.now() - msgTime.getTime()) <= MAX_MESSAGE_AGE_MS;
+        return msgTime && (Date.now() - msgTime.getTime()) <= MAX_MESSAGE_AGE_MS;
     }
 
     function shouldHide(msgDiv) {
@@ -66,24 +66,24 @@
         if (isSystemMessage(msgDiv)) {
             return hideSystemMessages;
         }
-        const hasReactions = msgDiv.querySelector('[class*="reaction"]') !== null;
+        const hasReactions = !!msgDiv.querySelector('[class*="reaction"]');
         const accessoriesDiv = msgDiv.querySelector('[id^="message-accessories-"]');
         const hasAccessories = accessoriesDiv && accessoriesDiv.children.length > 0;
         return hasReactions || hasAccessories;
     }
 
     function hideMessage(msgItem) {
-        if (MAX_HIDDEN_MESSAGES > 0 && hiddenCount >= MAX_HIDDEN_MESSAGES) return;
         const msgDiv = msgItem.querySelector('div');
-        if (!msgDiv || msgItem.dataset._hidden) return;
+        if (!msgDiv || msgItem.dataset._hidden) return false;
         if (shouldHide(msgDiv)) {
             msgItem.dataset._hidden = 'true';
             msgDiv.style.visibility = 'hidden';
             msgDiv.style.pointerEvents = 'none';
             msgDiv.style.opacity = '0';
             msgDiv.style.height = `${msgDiv.offsetHeight}px`;
-            hiddenCount++;
+            return true;
         }
+        return false;
     }
 
     function revealSystemMessage(msgItem) {
@@ -95,48 +95,50 @@
         msgDiv.style.opacity = '';
         msgDiv.style.height = '';
         delete msgItem.dataset._hidden;
-        hiddenCount = Math.max(0, hiddenCount - 1);
     }
 
     function hideMessagesBatch(msgItems, index = 0, callback) {
         if (index >= msgItems.length) {
-            processingBatch = false;
             if (callback) callback();
             return;
         }
-        hideMessage(msgItems[index]);
-        setTimeout(() => hideMessagesBatch(msgItems, index + 1, callback), HIDE_DELAY_MS);
+        const didHide = hideMessage(msgItems[index]);
+        setTimeout(
+            () => hideMessagesBatch(msgItems, index + 1, callback),
+            didHide ? HIDE_DELAY_MS : 0
+        );
     }
 
     function hideAllLoadedMessages(callback) {
-        if (processingBatch) return;
         const allItems = Array.from(document.querySelectorAll(MESSAGE_ITEM_SEL));
-        processingBatch = true;
         hideMessagesBatch(allItems, 0, callback);
     }
 
     function revealHiddenSystemMessages() {
-        const hiddenItems = Array.from(document.querySelectorAll(`${MESSAGE_ITEM_SEL}[data-_hidden="true"]`));
+        const hiddenItems = document.querySelectorAll(`${MESSAGE_ITEM_SEL}[data-_hidden="true"]`);
         hiddenItems.forEach(item => revealSystemMessage(item));
     }
 
     function onNewMessages(mutations) {
-        for (const mut of mutations) {
-            for (const node of mut.addedNodes) {
-                if (node.nodeType !== 1) continue;
-                if (!node.matches(MESSAGE_ITEM_SEL)) continue;
+        mutations.forEach(mut => {
+            mut.addedNodes.forEach(node => {
+                if (node.nodeType !== 1) return;
+                if (!node.matches(MESSAGE_ITEM_SEL)) return;
                 hideMessage(node);
-            }
-        }
+            });
+        });
     }
 
     function watchNewMessages() {
         const scrollContainer = document.querySelector(SCROLLER_SELECTOR);
         if (!scrollContainer) return;
-        const observer = new MutationObserver(onNewMessages);
-        observer.observe(scrollContainer, { childList: true, subtree: true });
+        new MutationObserver(onNewMessages).observe(scrollContainer, {
+            childList: true,
+            subtree: true
+        });
     }
 
+    let scrollTimeout = null;
     function onScrollStop() {
         hideAllLoadedMessages();
     }
@@ -144,7 +146,7 @@
     function hookScrollWatcher() {
         const scroller = document.querySelector(SCROLLER_SELECTOR);
         if (!scroller) {
-            setTimeout(hookScrollWatcher, 500);
+            setTimeout(hookScrollWatcher, 300);
             return;
         }
         scroller.addEventListener('scroll', () => {
@@ -153,17 +155,20 @@
         });
     }
 
-    function waitForUIReady() {
+    function waitForUIReady(anchorDate) {
         return new Promise(resolve => {
-            const check = () => {
+            let delay = UI_POLL_INITIAL_DELAY_MS;
+            function check() {
                 const scroller = document.querySelector(SCROLLER_SELECTOR);
-                const anchor = Array.from(document.querySelectorAll(DIVIDER_SEL)).find(div => div.getAttribute('aria-label')?.trim() === anchorDateString);
+                const anchor = Array.from(document.querySelectorAll(DIVIDER_SEL))
+                    .find(div => div.getAttribute('aria-label')?.trim() === anchorDate);
                 if (scroller && anchor) {
                     resolve(anchor);
                 } else {
-                    setTimeout(check, 300);
+                    setTimeout(check, delay);
+                    delay = Math.min(delay * 1.5, UI_POLL_MAX_DELAY_MS);
                 }
-            };
+            }
             check();
         });
     }
@@ -176,40 +181,35 @@
             alert("Invalid date format. Use DD/MM/YYYY or D/M/YY.");
             return;
         }
-        anchorDateString = parsed;
 
-        const scrollContainer = document.querySelector(SCROLLER_SELECTOR);
-        if (!scrollContainer) return;
+        const scroller = document.querySelector(SCROLLER_SELECTOR);
+        if (!scroller) {
+            alert("Discord UI not fully loaded. Try again in a moment.");
+            return;
+        }
+        const loadedDividers = Array.from(document.querySelectorAll(DIVIDER_SEL));
+        const targetImmediate = loadedDividers.find(div => div.getAttribute('aria-label')?.trim() === parsed);
 
-        const dividers = Array.from(scrollContainer.querySelectorAll(DIVIDER_SEL));
-        const target = dividers.find(div => {
-            const aria = div.getAttribute('aria-label')?.trim();
-            return aria === anchorDateString;
-        });
-
-        if (!target) {
-            alert(`Divider "${anchorDateString}" not found among currently loaded dividers. Scroll to that date and try again.`);
+        if (!targetImmediate) {
+            alert(`Divider "${parsed}" not found among currently loaded messages. Scroll to that date and try again.`);
             return;
         }
 
         let iteration = 0;
         async function doLoop() {
-            await waitForUIReady();
-            hideAllLoadedMessages(() => {
-                const hiddenItems = Array.from(document.querySelectorAll(`${MESSAGE_ITEM_SEL}[data-_hidden="true"]`));
-                hiddenItems.forEach(item => item.style.display = 'none');
+            const target = await waitForUIReady(parsed);
+            const hiddenItems = Array.from(document.querySelectorAll(`${MESSAGE_ITEM_SEL}[data-_hidden="true"]`));
+            hiddenItems.forEach(item => { item.style.display = 'none'; });
+            setTimeout(async () => {
+                const anchorNow = Array.from(document.querySelectorAll(DIVIDER_SEL))
+                    .find(div => div.getAttribute('aria-label')?.trim() === parsed);
+                if (anchorNow) anchorNow.scrollIntoView({ block: 'start' });
 
-                setTimeout(async () => {
-                    await waitForUIReady();
-                    const target = Array.from(document.querySelectorAll(DIVIDER_SEL)).find(div => div.getAttribute('aria-label')?.trim() === anchorDateString);
-                    if (target) target.scrollIntoView({ block: 'start' });
-
-                    iteration++;
-                    if (iteration < HIDE_SCROLL_LOOP_COUNT) {
-                        setTimeout(doLoop, LOOP_DELAY_MS);
-                    }
-                }, LOOP_DELAY_MS);
-            });
+                iteration++;
+                if (iteration < HIDE_SCROLL_LOOP_COUNT) {
+                    setTimeout(doLoop, LOOP_DELAY_MS);
+                }
+            }, LOOP_DELAY_MS);
         }
 
         doLoop();
@@ -217,30 +217,39 @@
 
     function createControlButtons() {
         const container = document.createElement('div');
-        container.style.position = 'fixed';
-        container.style.top = '90px';
-        container.style.right = '15px';
-        container.style.zIndex = '9999';
-        container.style.background = '#2f3136';
-        container.style.padding = '8px';
-        container.style.borderRadius = '6px';
-        container.style.boxShadow = '0 0 10px rgba(0,0,0,0.3)';
-        container.style.display = 'flex';
-        container.style.flexDirection = 'column';
-        container.style.gap = '6px';
+        Object.assign(container.style, {
+            position: 'fixed',
+            top: '90px',
+            right: '15px',
+            zIndex: '9999',
+            background: '#2f3136',
+            padding: '8px',
+            borderRadius: '6px',
+            boxShadow: '0 0 10px rgba(0,0,0,0.3)',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '6px'
+        });
 
         const toggleBtn = document.createElement('button');
         toggleBtn.textContent = 'Hide System Msgs (Off)';
         Object.assign(toggleBtn.style, {
-            background: '#5865F2', color: 'white', border: 'none', padding: '5px 10px', borderRadius: '4px', cursor: 'pointer', fontSize: '12px'
+            background: '#5865F2',
+            color: 'white',
+            border: 'none',
+            padding: '5px 10px',
+            borderRadius: '4px',
+            cursor: 'pointer',
+            fontSize: '12px'
         });
         toggleBtn.onclick = () => {
             hideSystemMessages = !hideSystemMessages;
             toggleBtn.textContent = `Hide System Msgs (${hideSystemMessages ? 'On' : 'Off'})`;
+
             if (hideSystemMessages) {
                 const sysItems = Array.from(document.querySelectorAll(MESSAGE_ITEM_SEL)).filter(item => {
                     const div = item.querySelector('div');
-                    return div && isSystemMessage(div) && !item.dataset._hidden && isRecent(div);
+                    return div && isSystemMessage(div) && isRecent(div) && !item.dataset._hidden;
                 });
                 hideMessagesBatch(sysItems);
             } else {
@@ -251,7 +260,13 @@
         const fullHideBtn = document.createElement('button');
         fullHideBtn.textContent = 'Fully Hide Hidden (Choose Date)';
         Object.assign(fullHideBtn.style, {
-            background: '#ff4757', color: 'white', border: 'none', padding: '5px 10px', borderRadius: '4px', cursor: 'pointer', fontSize: '12px'
+            background: '#ff4757',
+            color: 'white',
+            border: 'none',
+            padding: '5px 10px',
+            borderRadius: '4px',
+            cursor: 'pointer',
+            fontSize: '12px'
         });
         fullHideBtn.onclick = fullyRemoveHiddenMessages;
 
